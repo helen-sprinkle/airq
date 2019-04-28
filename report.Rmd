@@ -1,0 +1,341 @@
+---
+title: "Air Quality Forecast"
+author: "Helen Chang"
+date: "2019/4/16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### 1) Introduction
+An air quality index is set to be indicate the level of pollution in the area. As the AQI increases, an increasingly large percentage of the population is likely to experience increasingly severe adverse health effects. Therefore, forcasting the air quality is helpful for the public awareness and also for the government to take action or control.  
+```{r data_prep, include=FALSE}
+source("../auxiliary/mylib.R")
+mylib(c("data.table", "magrittr", "summarytools", "ggplot2", "dplyr", "corrplot", 
+        "tibbletime", "anomalize", "reshape2", "pracma", "forecast", "tseries"))
+dt <- fread("data/raw_input/AirQualityUCI.csv", dec=",")
+dt <- dt[, -c(16, 17)][Date!=""]
+tm <- as.POSIXct(strptime(paste(dt$Date, dt$Time, sep=" "), format = "%d/%m/%Y %H.%M.%S", tz="GMT"))
+dt[, datetime:=tm]
+dt <- dt[, -c(1, 2)]
+# difftime(max(tm, na.rm = T),min(tm, na.rm = T), "days", tz="CST")
+setorder(dt, datetime)
+setnames(dt, colnames(dt), c("CO_GT", "CO", "NMHC_GT", "C6H6_GT", "NMHC",
+                             "NOx_GT", "NOx", "NO2_GT", "NO2", "O3", "T", "RH", "AH", "datetime"))
+dt <- dt[, .(CO, CO_GT, NMHC, NMHC_GT, NO2, NO2_GT, NOx, NOx_GT, O3, C6H6_GT, T, RH, AH, datetime)]
+dt[,NO2_GT:=as.numeric(NO2_GT)]
+for (j in seq_len(ncol(dt)))
+  set(dt,which(dt[[j]]==-200), j, NA)
+```
+### 2) Data Summary  
+#### Attribute Information: The dataset has been reorganized with more comprehensive naming.  
+<Data source>[Data source](https://archive.ics.uci.edu/ml/datasets/Air+Quality)  
+
+(@) CO: [3] PT08.S1 (tin oxide) hourly averaged sensor response (nominally CO targeted)	
+(@) CO_GT: [2] True hourly averaged concentration CO in mg/m^3^ (reference analyzer)  
+(@) NMHC: [6] PT08.S2 (titania) hourly averaged sensor response (nominally NMHC targeted)	
+(@) NMHC_GT: [4] True hourly averaged overall Non Metanic HydroCarbons concentration in $\mu g/m^{3}$ (reference analyzer)  
+(@) NO2: [10] PT08.S4 (tungsten oxide) hourly averaged sensor response (nominally NO~2~ targeted)	
+(@) NO2_GT: [9] True hourly averaged NO~2~ concentration in $\mu g/m^{3}$ (reference analyzer)	 
+(@) NOx: [8] PT08.S3 (tungsten oxide) hourly averaged sensor response (nominally NO~x~ targeted) 
+(@) NOx_GT: [7] True hourly averaged NO~x~ concentration in ppb (reference analyzer)  
+(@) O3: [11] PT08.S5 (indium oxide) hourly averaged sensor response (nominally O~3~ targeted)  
+(@) C6H6_GT: [5] True hourly averaged Benzene concentration in $\mu g/m^{3}$ (reference analyzer)   
+(@) T: [12] Temperature in °C
+(@) RH: [13] Relative Humidity (%) 
+(@) AH: [14] Absolute Humidity 
+(@) datetime: concatenate original data [0] Date (DD/MM/YYYY) and [1] Time (HH.MM.SS)   
+
+#### The table belows shows the summary statistics in each column.  
+* Take column CO as an example, the CO sensor response ranged from 647 to 2040, with the median (1063) slightly smaller than it's mean (1099.83), which means it is right-skewed (as shown in the graph column). The dispersion also can be told as sd = 217.08 (standard deviation), IQR = 294 (interquantile range) and CV = 0.2 (coefficient of variation <coefficient of variation>[[ref]](https://en.wikipedia.org/wiki/Coefficient_of_variation)).  
+* Also the datetime of this dataset starts from 2004-03-10 18:00:00 to 2005-04-04 14:00:00, which are 9357 hours (more than 389 days) in total.  
+
+```{r dfSummary, echo=FALSE}
+dfs.raw <- dfSummary(dt)
+fnm <- sprintf("./%s.html", "dtSummary_raw_embed")
+print(dfs.raw, file=fnm, report.title=NA, footnote=NA, method="browser", omit.headings=TRUE,silent=T)
+htmltools::includeHTML(fnm)
+```
+
+#### Missing Values  
+* NMHC_GT: Most of values are missing, with only 914 (9.77%) data points valid. 
+* CO_GT / NO2_GT / NOx_GT: these three variables are about 17.99% missing.  
+* The rest of 9 variables have 366 data points missing.  
+
+#### Pearson Correlation Coefficient  
+* In summary, CO / NO~2~ / NO~x~ / NMHC has both reference analyzer values and sensor responses. Meanwhile, O~3~ has only sensor response, and C~6~H~6~ (Benzene) has only reference analyzer values.  
+* Each pair of sensor response and reference analyzer is highly correlated as expected.
+* Only NO~x~ signal has negative correlation to other chemicals.
+* Most of the chemicals are highly correlated with each other, and affect the air quality with no doubt.  
+```{r corr, echo=FALSE}
+dt.no.na <- select(dt, -NMHC_GT) %>% na.omit()
+M <- select(dt.no.na, -datetime) %>% cor(.)
+original.CO_GT.corr <- M["CO_GT",]
+corrplot.mixed(M, lower.col = "black", tl.cex=0.5)
+```  
+
+### 3) Fill the Missing Values  
+#### First try: simple linear regression  
+$CO\_GT=a_1 * CO + a_0$  
+
+* Since variable CO is from the sensor response and is hightly related to the reference analyzer values of CO_GT (cor=0.88), simple linear regression is promising.  
+```{r first_na, echo=FALSE}
+dt.co <- dt[, .(datetime, CO, CO_GT, NMHC, C6H6_GT)] %>% na.omit()
+linearMod <- lm(CO_GT ~ CO, data=dt.co)
+summary(linearMod)
+```  
+* Above shows the adjusted R-squared = 0.7731, it's a good start.  
+* But the scatter plot (figure below) between CO and CO_GT seems that it might need some transformation.  
+```{r co_transform, echo=FALSE, fig.height=6, fig.width=11}
+par(mfrow=c(1,2))
+plot(dt.co$CO, dt.co$CO_GT)
+title(main="Original CO")
+plot((dt.co$CO)^2, dt.co$CO_GT)
+title(main="Transformed CO")
+```
+
+#### Second try: data transformation 
+$CO\_GT = a_1 * CO^2 + a_0$  
+```{r second_na, echo=FALSE}
+dt.co[, CO_sq:=CO^2]
+dt[, CO_sq:=CO^2]
+linearMod <- lm(CO_GT ~ CO_sq, data=dt.co)
+summary(linearMod)
+```
+
+* Adjusted R-squared went up to 0.7865.  
+
+#### Third try: adding more variables with relatively high correlation coefficents  
+$CO\_GT = a_2 * C6H6\_GT + a_1 * CO^2 + a_0$  
+
+```{r thrid_na, echo=FALSE}
+linearMod <- lm(CO_GT ~ CO_sq + C6H6_GT, data=dt.co)
+summary(linearMod)
+```
+
+* Adjusted R-squared improved to 0.8854.  
+* There's no need to transform the variable C6H6_GT as shown in figure below:  
+```{r benzene_transform, echo=FALSE, fig.height=6, fig.width=6}
+plot(dt.co$C6H6_GT, dt.co$CO_GT)
+title(main="Original C6H6")
+```  
+
+#### Finally: fill the predicted values into CO_GT variable.  
+```{r final_na_predict, echo=FALSE}
+distPred <- predict(linearMod, dt[is.na(CO_GT)&!is.na(CO), .(CO_sq, C6H6_GT)])
+dt[is.na(CO_GT)&!is.na(CO), CO_GT:=distPred]
+```  
+* Still, there are 36 data points remain NA in variable CO_GT.  
+* Try handeling the rest of the missing values by simple average of nearest data point in +/- one hour, and +/- one day (24 hour).  
+```{r fill_NA}
+na.fill <- sapply(which(is.na(dt$CO_GT)), function (i) {
+  dt$CO_GT[c(i-1, i+1, i-24, i+24)] %>% mean(., na.rm = T)
+})
+dt[is.na(dt$CO_GT), CO_GT:=na.fill]
+```  
+* Some of the correlation between CO_GT and other chemical compunds slightly increased (+/-0.02 max), but not a very big influence.  
+```{r fitted_CO_corr, echo=FALSE}
+dt.no.na <- select(dt, -NMHC_GT) %>% na.omit()
+M1 <- select(dt.no.na, -c(datetime, CO_sq)) %>% cor(.)
+fitted.CO_GT.corr <- M1[,"CO_GT"]
+```
+```{r corr_deviation}
+print(list(deviation=round(fitted.CO_GT.corr-original.CO_GT.corr, 3),
+           fitted.CO_GT.corr=fitted.CO_GT.corr,
+           original.CO_GT.corr=original.CO_GT.corr))
+```  
+
+* Same NA handling can be performed on NO2_GT and NOx_GT variables.  
+```{r NO2_na, echo=FALSE}
+dt.no <- dt[, .(datetime, CO, CO_GT, NO2, NO2_GT, NOx, C6H6_GT, NMHC)] %>% na.omit()
+dt.no[, `:=` (CO_GT_sqr=(CO_GT)^(1/2),
+              NOx_sqr=NOx^(-1/2),
+              C6H6_GT_sqr=C6H6_GT^(1/2))]
+dt[, `:=` (CO_GT_sqr=(CO_GT)^(1/2),
+           NOx_sqr=NOx^(-1/2),
+           C6H6_GT_sqr=C6H6_GT^(1/2))]
+linearMod <- lm(NO2_GT ~ NO2+NOx_sqr+C6H6_GT_sqr+NMHC+CO_GT_sqr+CO, data=dt.no)
+distPred <- predict(linearMod, 
+                    dt[is.na(NO2_GT), 
+                       .(NO2, NOx_sqr, C6H6_GT_sqr,NMHC,CO_GT_sqr,CO)])
+dt[is.na(NO2_GT), NO2_GT:=distPred]
+```
+
+
+### 4) Air Quality Index
+#### The <air quality index>[air quality index](https://en.wikipedia.org/wiki/Air_quality_index) is calculated regarding to the air pollutant concertrations and have different standards from different countries.  
+From the dataset, the concentration of CO and NO~2~ were provided among the six categories mentioned on EPA's website <EPA air quality>[[ref]](https://taqm.epa.gov.tw/taqm/tw/b0201.aspx), as shown in the following figure.  
+
+![Fig. The Air Quality Index from EPA Taiwan](air_quality_EPA_TW.png)  
+
+#### Calculation of the Air Quality Index (CO and NO~2~)  
+* Now try to calculate the air quality index from the original chemical concentrations of CO_GT. (Also applied to NO2_GT, but skipped here.)  
+```{r co_index}
+# Calculation example: original chemical concentrations (CO)
+# [ref] http://www.aresok.org/npg/nioshdbs/calc.htm (25 degrees Celsius assumed)
+# Smoothing: 8 hour moving average
+co.smooth <- (dt$CO_GT[!is.na(dt$CO_GT)] * 24.45 / 28) %>% 
+  movavg(., 8, "s") %>% 
+  round(., 1)
+# Set the air quality intervals
+air.quality.lvls <- c(0, 51, 101, 151, 201, 301, 401) 
+# Set the CO concentration intervals
+breaks <- c(0, 4.5, 9.5, 12.5, 15.5, 30.5, 40.5, 50.4) 
+# Identify which interval
+lvls <- cut(co.smooth, breaks) %>% as.integer() 
+# Calculate the air quality index
+co.calculate <- ((air.quality.lvls[lvls+1] - air.quality.lvls[lvls]) * (co.smooth-breaks[lvls])) / (breaks[lvls+1] - breaks[lvls]) + air.quality.lvls[lvls]
+# Round up air quality index of CO
+dt[!is.na(CO_GT), `:=` (CO.index=round(co.calculate, 1),
+                        CO.level=lvls)]
+```  
+```{r NO_index, echo=FALSE}
+# Calculation example: original chemical concentrations (NO2)
+# Smooth: 8 hour moving average
+no.smooth <- (dt$NO2_GT[!is.na(dt$NO2_GT)] * 24.45 / 28) %>% 
+  movavg(., 8, "s") %>% 
+  round(., 1)
+# Set the NO2 concentration intervals
+breaks <- c(0, 54, 101, 361, 651, 1250, 1650)
+# Identify which interval
+lvls <- cut(no.smooth, breaks) %>% as.integer() 
+# Calculate the air quality index
+no.calculate <- ((air.quality.lvls[lvls+1] - air.quality.lvls[lvls]) * (no.smooth-breaks[lvls])) / (breaks[lvls+1] - breaks[lvls]) + air.quality.lvls[lvls]
+# round up air quality index of NO2
+dt[!is.na(NO2_GT), `:=` (NO2.index=round(no.calculate, 1),
+                         NO2.level=lvls)]
+```  
+Compare the level of air quality between CO and NO~2~:  
+* Level 1: AQI = 0 ~ 50 (Good)  
+* Level 2: AQI = 51 ~ 100 (Normal)  
+* Level 3: AQI = 101 ~ 150 (Harmful to sensitive people)  
+* Level 4: AQI = 151 ~ 200 (Unhealthy to everyone)  
+* Level 5: AQI = 201 ~ 300 (Very Unhealthy)  
+* Level 6/7: AQI = 301 ~ 500 (Dangerous)  
+As we can see the level of NO~2~ is relatively higher than CO, where NO~2~ has nearly 40% of time reach level 3 (harmful to sensitive people).
+```{r CO_NO2_level_ctbl, echo=FALSE}
+dfs.ctable <- ctable(dt$CO.level, dt$NO2.level, prop = "t", useNA="ifany", omit.headings = TRUE)
+fnm <- sprintf("./%s.html", "dfs_ctable_embed")
+print(dfs.ctable, file=fnm, report.title=NA, footnote=NA, method="browser", silent=T)
+htmltools::includeHTML(fnm)
+```  
+
+#### Benzene Mesurement for Air Quality (C6H6_GT)  
+* Benzene is not listed in the table of EPA, however, it is hazardous to human body when it exceeds a certain level (17 $\mu g/m^{3}$ [[ref]](https://www.iaq.gov.hk/media/67695/annex-summary-of-old-and-new-iaqos_chi_v2.pdf)).  
+* Similar to the level of AQI, it is set to level 1 as safe (C6H6_GT < 17), and level 3 as hazardous (C6H6_GT >= 17), since level 1 and 2 defined in AQI are health condition.  
+```{r Benzene_NO2_level_ctbl, echo=FALSE}
+# Calculation example: original chemical concentrations (NOx)
+# Smooth: 8 hour moving average
+C6H6.smooth <- (dt$C6H6_GT[!is.na(dt$C6H6_GT)]) %>% movavg(., 8, "s")
+C6H6.level <- ifelse(C6H6.smooth<17, "Safe", "Hazardous")
+table(C6H6.level)
+dt[!is.na(C6H6_GT), C6H6.level:=ifelse(C6H6.smooth<17, 1, 3)]
+dfs.ctable <- ctable(dt$C6H6.level, dt$NO2.level, prop = "t", useNA="ifany", omit.headings = TRUE)
+fnm <- sprintf("./%s.html", "dfs_ctable_C6H6_embed")
+print(dfs.ctable, file=fnm, report.title=NA, footnote=NA, method="browser", silent=T)
+htmltools::includeHTML(fnm)
+```  
+
+* It is noticed that 44 data points of NO~2~ are missing and need to be filled later.  
+
+#### O~3~ Estimation  
+* In the dataset, the true O~3~ concentration is not provided, only the sensor response.  
+* However, it was observed that NMHC, NO~2~, and O~3~ are related as shown in the following figure:    
+```{r O3_indicator_ts, echo=FALSE}
+dt2 <- melt.data.table(dt[, .(datetime, O3, NOx, NMHC)], id.vars="datetime")
+target.tm <- as.Date("2005-02-21")
+ggplot(dt2[datetime>=target.tm&datetime<=target.tm+3],aes(x=datetime,y=value,colour=variable,group=variable)) + geom_line()
+```  
+
+* According to <EPA_O3>[EPA](https://taqm.epa.gov.tw/taqm/tw/b0104.aspx) and the <google book>[book](https://books.google.com.tw/books?id=llhhDQAAQBAJ&pg=PA429&lpg=PA429&dq=O3+NMHC+NOx&source=bl&ots=HEJpGG-lsx&sig=ACfU3U1dOIBP4lg41nomestZj8gterrWgA&hl=en&sa=X&ved=2ahUKEwjr0OOo_8zhAhW8xYsBHeSyDAMQ6AEwA3oECAcQAQ#v=onepage&q=O3%20NMHC%20NOx&f=false), photochemical reaction (UV energy) under suitable meteorological (M) condition, $$NMHC + NO_x + UV energy + M \rightarrow O_3 + other\_products$$ which means NO~x~ and NMHC combined will produce O~3~. In the mean time, both O~3~ and NMHC only have sensor response and it is unknown for how to retrieve true concentration from them, so it is suggested that NOx_GT could be a representation to the other two variables.  
+* The NOx_GT variable in concentration is transformed in to ppm level according to the [[ref]](http://www.globalcombustion.com/nox-measurement/). In the mean time, the eight-hour average of O~3~ can roughly be transformed to NO~x~ concentration in 1:1 condition. (NO~x~:O~3~ = 1:1 assumed, i.e. the Level 1 of O~3~ AQI is 0~ 0.054 ppm)  
+* O~3~ AQI level counts (estimated from NO~x~), and <NA> means values more than the upper limit in Level 5 (300), which can be viewd as level 6, 7 or higher.
+```{r NOx_index, echo=FALSE}
+# Calculation example: 
+# NOx concentration estimated by 1:1 tranlated to NOx then smoothed 8 hour moving average
+nox.smooth <- (dt$NOx_GT[!is.na(dt$NOx_GT)] * 24.45 / 46 / 1000) %>% 
+  movavg(., 8, "s")
+# Set the NOx concentration intervals
+breaks <- c(0, 0.055, 0.071, 0.086, 0.106, 0.201)
+# Identify which interval
+lvls <- cut(nox.smooth, breaks) %>% as.integer() 
+# Calculate the air quality index
+nox.calculate <- ((air.quality.lvls[lvls+1] - air.quality.lvls[lvls]) * (nox.smooth-breaks[lvls])) / (breaks[lvls+1] - breaks[lvls]) + air.quality.lvls[lvls]
+# round up air quality index of NO2
+dt[!is.na(NOx_GT), `:=` (NOx.index=round(nox.calculate, 1),
+                         NOx.level=lvls)]
+table(dt$NOx.level, useNA = "always")
+#hist(nox.smooth)
+```  
+
+* The O~3~ estimated level listed above has quite different distribution then previous Air Quality Index of CO and NO~2~. There are more then 50% of data points higher then level 5 (2125 + 3189), while CO and NO~2~ has maximum level only up to level 3.  
+* The reason might be that **the assumption of NO~x~:O~3~ = 1:1 is invalid**, since not all NO~x~ would be totally consumed and turn into O~3~. And it is uncertain how to quantify air quality index from the relations between NMHC, NO~x~ and O~3~, neither do the relations between the sensor responses and ground truth measurements. **Therefore, O~3~, NO~x~ and NMHC is temperarily ignored for air quality index calculation.**  
+
+#### Integrated Air Quality Index  
+* The Air Quality Index (AQI) is integerated from each individual air quality index (IAQI) [[ref]](https://zh.wikipedia.org/wiki/%E7%A9%BA%E6%B0%94%E8%B4%A8%E9%87%8F%E6%8C%87%E6%95%B0) : $$AQI = max\textrm{ }\{IAQI_1,\textrm{ }IAQI_2,\textrm{ }AQI_3,\textrm{ }…,\textrm{ }IAQI_n \}$$ and was originally planned to select the maximum quality level from CO, NO~2~, O~3~ and C~6~H~6~.  However, O~3~ values takes further investigation to obtain, so will be ignored. For C~6~H~6~, it is set to level 1 as safe, and level 3 as hazardous.  
+* Below shows the three individual AQIs, CO, NO~2~ and O~3~ level, and the integrated AQI (AQI.level).
+```{r IAQIs, echo=FALSE}
+dt.level <- dt[, .(CO.level, NO2.level, C6H6.level)]
+int.level <- sapply(1:nrow(dt.level), function(i) {
+  max(dt.level[i, with=T])
+})
+dt[, AQI.level:=int.level]
+print(dt[, .(datetime, CO.level, NO2.level, C6H6.level, AQI.level)])
+```  
+
+### 5) Air Quality Prediction  
+* According to the previous result, it seems that the integrated AIQ for the next 5 days (120 hours) is up to 3 levels and could be trained by RNN. Also the temperature and humidity could be leveraged to since the relationship between air quality and the weather condition can be further discussed.  
+* But before preparing and exploring more features and try RNN method (will not be included in this report), **single variable of time series forcasting can be preformed as base line**.  
+
+#### First Try on predition to Air Quality Index of CO (Single-Variable)  
+* To predict the next 5 days (120 hours) IAQI of CO by ARIMA model.  
+* First check the stationarity the IAQI_CO:  
+```{r CO_ts, echo=FALSE}
+dt$CO.index %>% ggtsdisplay()
+```  
+
+* The IAQI_CO is not stationary and should perform first-level difference.  
+
+```{r 1st_level_acf}
+t.data <- dt$CO.index %>% diff()
+ggAcf(t.data,main="", lag.max=200) + geom_vline(xintercept = c(24, 48), linetype="dotted")
+```  
+
+* After first-difference it looks like 24 lag periodically.  
+* Further specified lag 24 in diff() yet another period around lag 168 as shown below:  
+
+```{r 1st_level_acf_24}
+t.data <- dt$CO.index %>% diff(24)
+ggAcf(t.data,main="", lag.max=500) + geom_vline(xintercept = c(168, 335), linetype="dotted")
+```  
+
+* Therefore the seasonal period = 168 is determined. Others parameters are selected by the lowest AICc, as ARIMA(p,d,q)(P,D,Q)~period~ = ARIMA(3,1,2)(0,1,0)~168~.  
+* 8736 hours of data points were selected for training, and the next 120 hours of data points were kept for validation set.  
+* As we can see in the fitted result, the periodic patterns were significantly reduced, compare to the previous Acf plot. This should be the improvement factor of better ARIMA model.  
+```{r CO_ts_ARIMA, echo=FALSE}
+# fit <- ts(dt$CO.index[1:8736], frequency=24) %>%
+#   Arima(order=c(3,1,2), seasonal=list(order=c(0,1,0), period=168))
+load("data/models/fitted.RData")
+fit %>% residuals() %>% ggtsdisplay()
+```
+```{r CO_ts_ARIMA_fitted, echo=FALSE}
+pred <- fit %>% forecast(h=120)
+actl <- dt$CO.index[8737:(8737+119)]
+# sqrt(sum((pred$mean-actl)^2)/length(actl))
+# sum(abs(pred$mean-actl))/length(actl)
+```  
+* Below shows the fitted plot:  
+* The MAE and RMSE of the result is around `r round(sum(abs(pred$mean-actl))/length(actl), 2)` and `r round(sqrt(sum((pred$mean-actl)^2)/length(actl)),2)` accordingly.  
+```{r}
+pred %>% autoplot(include = 1000) + ylab("Air Quality Index of CO") + xlab("Hour")
+```  
+* The IAQI of NO~2~ and C~6~H~6~ (Benzene) can be predicted by ARIMA in a similar way.  
+
+### 6) Conclusion  
+* Six chemical concentrations, CO / NO~2~ / NO~x~ / NMHC / O~3~ / C~6~H~6~, are included in the dataset. Four of them (CO / NO~2~ / NO~x~ / NMHC) has both reference analyzer values and sensor responses. Meanwhile, O~3~ has only sensor response, and C~6~H~6~ (Benzene) has only reference analyzer values. As analyzed, most of the chemicals are highly correlated both pairwise and with each other, and affect the air quality index.  
+* To tackle the problem of missing values, linear regression is used to fill most them. Notably, the models are well fitted (adj-R^2 higher than 0.7). The rest few are simply compensated by nearest data points.  
+* The definition of the indicator for O~3~ IAQI is ambiguous at first glance, which might need much more information or domain knowledge to specify the relations. Hence, this part is pending.  
+* The integrated Air Quality Index is defined by individual AQI CO / NO~2~ / O~3~ / C~6~H~6~.  
+* In the forecast part, ARIMA method was performed to model the IAQI of CO and the fitting results is evaluated by MAE and RMSE. For the time series CO (NA handled), two periodical patterns were found at lags 24 and 168 (hour), which improves the fitted result.  
+* Further prediction on integrated AQI can be trained by RNN or LSTM but not included in this report.  
